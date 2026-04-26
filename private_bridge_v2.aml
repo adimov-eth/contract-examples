@@ -1,0 +1,514 @@
+// private_bridge_v2.aml — rewritten against real AML (compile-verified).
+//
+// Design: a pool contract operating on user-supplied ciphertexts. Users
+// (not the contract) hold the PVAC keys; the contract stores ciphertexts,
+// verifies proofs on updates, and gates denominations + deposits/withdraws.
+//
+// This is NOT an "autonomous hook" — those would need fhe_self_pk,
+// fhe_contract_pk, and cross-contract call-with-value, all of which probe 04
+// proved unknown to the compiler as of 2026-04-24. Logs:
+//   pbridge/ops/logs/2026-04-24-probe-04-autonomous-hook.md
+//
+// Architecture mirrors OETHVaultLite (paused in prod, but its private_transfer
+// and unshield flows define the real AML FHE API) and BRIDGE_VAULT v3.1.0
+// (live, unpaused, the wOCT bridge's Octra side).
+//
+// Scope:
+//   - wOCT only. Uses the existing BRIDGE_VAULT for Ethereum-side settlement.
+//   - Fixed denominations {0.1, 1, 10, 100 OCT} enforced on every op.
+//   - Relayer-operator model (same as BRIDGE_VAULT, same trust).
+//   - Anti-trivial-trace: MIN_EPOCHS_BEFORE_SHIELD forces spacing between
+//     a bridge-in credit and the first private-transfer from that address.
+//
+// Out of scope: decentralized attestation, multi-relayer quorum, continuous
+// amounts, per-token adapters for arbitrary ERC20.
+
+contract PrivateBridge {
+
+  enum DepositStatus { Pending, Credited, Cancelled }
+  enum WithdrawStatus { Requested, Finalized, Reverted }
+
+  // ---- constants ----
+
+  // Denominations in 6-decimal OCT raw units.
+  const DENOM_0_1: int = 100000
+  const DENOM_1:   int = 1000000
+  const DENOM_10:  int = 10000000
+  const DENOM_100: int = 100000000
+
+  // Circuit breaker: max total held in the pool across all users.
+  const MAX_POOL: int = 100000000000
+
+  // Epochs of spacing between a deposit credit and the first shield op
+  // from that same recipient — reduces trivial trace correlation.
+  const MIN_EPOCHS_BEFORE_SHIELD: int = 2
+
+  const EPOCHS_PER_DAY: int = 8640
+
+  // Fee model mirrors OETHVaultLite: 5bps shield, 5bps unshield, 10bps burn.
+  const SHIELD_FEE_BPS:    int = 5
+  const UNSHIELD_FEE_BPS:  int = 5
+  const WITHDRAW_FEE_BPS:  int = 10
+  const FEE_DENOMINATOR:   int = 10000
+
+  // ---- events ----
+
+  event DepositCredited(burn_id: string, stealth_recipient: address, amount: int, deposit_id: int)
+  event PublicToPrivate(owner: address, amount: int)
+  event PrivateTransfer(from: address, to: address)
+  event PrivateToPublic(owner: address, amount: int)
+  event WithdrawRequested(eth_recipient: string, amount: int, withdraw_id: int)
+  event WithdrawFinalized(withdraw_id: int, eth_tx_hash: string)
+  event Paused(by: address)
+  event Unpaused(by: address)
+  event FeeCollected(kind: string, amount: int)
+
+  // ---- state ----
+
+  state {
+    owner: address
+    guardian: address
+    relayer: address
+    paused: int
+
+    // Deposit tracking — parallel maps keyed by deposit_id (no struct support in AML).
+    deposit_count: int
+    deposit_burn_ids: map[int]string
+    deposit_eth_senders: map[int]string
+    deposit_recipients: map[int]address
+    deposit_amounts: map[int]int
+    deposit_statuses: map[int]int
+    deposit_epochs: map[int]int
+
+    // Replay guard: 0 means not-credited, otherwise deposit_id + 1.
+    credited_burn_ids: map[string]int
+
+    // Withdraw tracking — parallel maps keyed by withdraw_id.
+    withdraw_count: int
+    withdraw_eth_recipients: map[int]string
+    withdraw_amounts: map[int]int
+    withdraw_statuses: map[int]int
+    withdraw_epochs: map[int]int
+
+    // User balances — public side legible, encrypted side opaque.
+    public_balances: map[address]int
+    encrypted_balances: map[address]string
+    has_encrypted: map[address]int
+
+    // Aggregate invariants.
+    pool_total: int
+    total_supply_public: int
+    total_supply_encrypted: int
+    accumulated_fees: int
+
+    // Anti-trivial-trace: epoch of last deposit credit per recipient.
+    last_deposit_epoch: map[address]int
+
+    reentrancy_lock: int
+  }
+
+  // ---- constructor ----
+
+  constructor(guardian_addr: address, relayer_addr: address) {
+    require(is_address(guardian_addr), "bad guardian")
+    require(is_address(relayer_addr), "bad relayer")
+    self.owner = caller
+    self.guardian = guardian_addr
+    self.relayer = relayer_addr
+    self.paused = 0
+    self.deposit_count = 0
+    self.withdraw_count = 0
+    self.pool_total = 0
+    self.total_supply_public = 0
+    self.total_supply_encrypted = 0
+    self.accumulated_fees = 0
+    self.reentrancy_lock = 0
+  }
+
+  // ---- admin guards ----
+
+  private fn only_owner() {
+    require(caller == self.owner, "not owner")
+  }
+
+  private fn only_guardian() {
+    require(caller == self.guardian, "not guardian")
+  }
+
+  private fn only_relayer() {
+    require(caller == self.relayer, "not relayer")
+  }
+
+  private fn not_paused() {
+    require(self.paused == 0, "paused")
+  }
+
+  private fn is_denom(amount: int): bool {
+    if amount == DENOM_0_1 { return true }
+    if amount == DENOM_1   { return true }
+    if amount == DENOM_10  { return true }
+    if amount == DENOM_100 { return true }
+    return false
+  }
+
+  private fn require_denom(amount: int) {
+    require(is_denom(amount), "bad denomination")
+  }
+
+  // Eth address validator — mirrors OETHVaultLite:240.
+  private fn validate_eth_address(addr: string) {
+    require(len(addr) == 42, "eth addr len")
+    require(substr(addr, 0, 2) == "0x", "eth addr prefix")
+    require(is_hex(substr(addr, 2, 40)), "eth addr hex")
+  }
+
+  // ---- deposit path (relayer-attested, Ethereum -> Octra) ----
+
+  fn credit_deposit(
+    burn_id: string,
+    eth_sender: string,
+    stealth_recipient: address,
+    amount: int
+  ): int {
+    not_paused()
+    only_relayer()
+    require_denom(amount)
+    require(is_address(stealth_recipient), "bad recipient")
+    require(len(burn_id) == 66, "bad burn_id")
+    require(self.credited_burn_ids[burn_id] == 0, "already credited")
+    require(self.pool_total + amount <= MAX_POOL, "pool full")
+
+    let id = self.deposit_count
+    self.deposit_burn_ids[id] = burn_id
+    self.deposit_eth_senders[id] = eth_sender
+    self.deposit_recipients[id] = stealth_recipient
+    self.deposit_amounts[id] = amount
+    self.deposit_statuses[id] = DepositStatus.Credited
+    self.deposit_epochs[id] = epoch
+    self.deposit_count = id + 1
+
+    self.credited_burn_ids[burn_id] = id + 1
+
+    self.public_balances[stealth_recipient] = self.public_balances[stealth_recipient] + amount
+    self.last_deposit_epoch[stealth_recipient] = epoch
+    self.pool_total = self.pool_total + amount
+    self.total_supply_public = self.total_supply_public + amount
+
+    emit DepositCredited(burn_id, stealth_recipient, amount, id)
+    return id
+  }
+
+  // ---- public -> private (shield) ----
+  //
+  // Caller supplies a ciphertext of `amount` under their own PVAC pubkey,
+  // plus a bound proof binding the ciphertext to `amount`. Contract verifies
+  // the proof and merges into the caller's encrypted balance.
+  //
+  // The pk is loaded from the caller's registered PVAC key on chain
+  // (same as OETHVaultLite's private_transfer).
+
+  fn shield(amount: int, ct: string, range_proof: string): bool {
+    not_paused()
+    require(self.reentrancy_lock == 0, "reentrant")
+    self.reentrancy_lock = 1
+
+    require_denom(amount)
+    require(len(ct) > 0, "empty ct")
+    require(len(range_proof) > 0, "empty proof")
+    require(self.public_balances[caller] >= amount, "insufficient public balance")
+    require(epoch >= self.last_deposit_epoch[caller] + MIN_EPOCHS_BEFORE_SHIELD, "deposit too recent")
+
+    let pk = fhe_load_pk(to_string(caller))
+    let amt_cipher = fhe_deser(ct)
+    let proof_ok = fhe_verify_bound(pk, amt_cipher, amount, range_proof)
+    require(proof_ok, "bound proof invalid")
+
+    let fee = amount * SHIELD_FEE_BPS / FEE_DENOMINATOR
+    let net = amount - fee
+    require(net > 0, "fee eats all")
+
+    self.public_balances[caller] = self.public_balances[caller] - amount
+    self.total_supply_public = self.total_supply_public - amount
+    self.total_supply_encrypted = self.total_supply_encrypted + net
+
+    if self.has_encrypted[caller] == 0 {
+      self.encrypted_balances[caller] = ct
+      self.has_encrypted[caller] = 1
+    } else {
+      let existing = fhe_deser(self.encrypted_balances[caller])
+      let combined = fhe_add(pk, existing, amt_cipher)
+      self.encrypted_balances[caller] = fhe_ser(combined)
+    }
+
+    if fee > 0 {
+      self.accumulated_fees = self.accumulated_fees + fee
+      emit FeeCollected("shield", fee)
+    }
+
+    emit PublicToPrivate(caller, net)
+    self.reentrancy_lock = 0
+    return true
+  }
+
+  // ---- private -> private ----
+  //
+  // Caller supplies a delta ciphertext encoding the amount to move; contract
+  // homomorphically subtracts from caller and adds to recipient. No proof of
+  // specific amount — the caller's balance is reduced by whatever the delta
+  // encodes, and if they over-withdraw, any later unshield will fail its
+  // bound proof and they lose use of those funds.
+  //
+  // Matches OETHVaultLite::private_transfer exactly.
+
+  fn private_transfer(to: address, ct_amount: string): bool {
+    not_paused()
+    require(is_address(to), "bad to")
+    require(self.has_encrypted[caller] == 1, "no encrypted bal")
+    require(len(ct_amount) > 0, "empty ct")
+
+    let pk = fhe_load_pk(to_string(caller))
+    let sender_cipher = fhe_deser(self.encrypted_balances[caller])
+    let amt_cipher = fhe_deser(ct_amount)
+
+    let new_sender = fhe_sub(pk, sender_cipher, amt_cipher)
+    self.encrypted_balances[caller] = fhe_ser(new_sender)
+
+    if self.has_encrypted[to] == 0 {
+      self.encrypted_balances[to] = ct_amount
+      self.has_encrypted[to] = 1
+    } else {
+      let recipient_cipher = fhe_deser(self.encrypted_balances[to])
+      let new_recipient = fhe_add(pk, recipient_cipher, amt_cipher)
+      self.encrypted_balances[to] = fhe_ser(new_recipient)
+    }
+
+    emit PrivateTransfer(caller, to)
+    return true
+  }
+
+  // ---- private -> public (unshield) ----
+  //
+  // Caller decrypts `claimed_amount` from their encrypted balance, with a
+  // bound proof binding the ciphertext-being-removed to the claimed amount.
+
+  fn unshield(claimed_amount: int, ct_amount: string, range_proof: string): bool {
+    not_paused()
+    require(self.reentrancy_lock == 0, "reentrant")
+    self.reentrancy_lock = 1
+
+    require_denom(claimed_amount)
+    require(self.has_encrypted[caller] == 1, "no encrypted bal")
+    require(len(ct_amount) > 0, "empty ct")
+    require(len(range_proof) > 0, "empty proof")
+
+    let pk = fhe_load_pk(to_string(caller))
+    let sender_cipher = fhe_deser(self.encrypted_balances[caller])
+    let amt_cipher = fhe_deser(ct_amount)
+
+    let proof_ok = fhe_verify_bound(pk, amt_cipher, claimed_amount, range_proof)
+    require(proof_ok, "bound proof invalid")
+
+    let fee = claimed_amount * UNSHIELD_FEE_BPS / FEE_DENOMINATOR
+    let net = claimed_amount - fee
+    require(net > 0, "fee eats all")
+
+    let new_sender = fhe_sub(pk, sender_cipher, amt_cipher)
+    self.encrypted_balances[caller] = fhe_ser(new_sender)
+
+    self.total_supply_encrypted = self.total_supply_encrypted - claimed_amount
+    self.total_supply_public = self.total_supply_public + net
+    self.public_balances[caller] = self.public_balances[caller] + net
+
+    if fee > 0 {
+      self.accumulated_fees = self.accumulated_fees + fee
+      emit FeeCollected("unshield", fee)
+    }
+
+    emit PrivateToPublic(caller, net)
+    self.reentrancy_lock = 0
+    return true
+  }
+
+  // ---- withdraw path (Octra -> Ethereum, relayer-mediated mint) ----
+
+  fn request_withdraw(eth_recipient: string, amount: int): int {
+    not_paused()
+    require_denom(amount)
+    validate_eth_address(eth_recipient)
+    require(self.public_balances[caller] >= amount, "insufficient public balance")
+
+    let fee = amount * WITHDRAW_FEE_BPS / FEE_DENOMINATOR
+    let net = amount - fee
+
+    let id = self.withdraw_count
+    self.withdraw_eth_recipients[id] = eth_recipient
+    self.withdraw_amounts[id] = net
+    self.withdraw_statuses[id] = WithdrawStatus.Requested
+    self.withdraw_epochs[id] = epoch
+    self.withdraw_count = id + 1
+
+    self.public_balances[caller] = self.public_balances[caller] - amount
+    self.total_supply_public = self.total_supply_public - amount
+    self.pool_total = self.pool_total - amount
+
+    if fee > 0 {
+      self.accumulated_fees = self.accumulated_fees + fee
+      emit FeeCollected("withdraw", fee)
+    }
+
+    emit WithdrawRequested(eth_recipient, net, id)
+    return id
+  }
+
+  fn finalize_withdraw(withdraw_id: int, eth_tx_hash: string): bool {
+    only_relayer()
+    require(withdraw_id < self.withdraw_count, "bad id")
+    require(self.withdraw_statuses[withdraw_id] == WithdrawStatus.Requested, "not requested")
+    self.withdraw_statuses[withdraw_id] = WithdrawStatus.Finalized
+    emit WithdrawFinalized(withdraw_id, eth_tx_hash)
+    return true
+  }
+
+  fn revert_withdraw(withdraw_id: int, refund_to: address): bool {
+    only_relayer()
+    require(is_address(refund_to), "bad refund")
+    require(withdraw_id < self.withdraw_count, "bad id")
+    require(self.withdraw_statuses[withdraw_id] == WithdrawStatus.Requested, "not requested")
+    let amt = self.withdraw_amounts[withdraw_id]
+    self.withdraw_statuses[withdraw_id] = WithdrawStatus.Reverted
+    self.public_balances[refund_to] = self.public_balances[refund_to] + amt
+    self.total_supply_public = self.total_supply_public + amt
+    self.pool_total = self.pool_total + amt
+    return true
+  }
+
+  // ---- admin ----
+
+  fn pause(): bool {
+    only_guardian()
+    self.paused = 1
+    emit Paused(caller)
+    return true
+  }
+
+  fn unpause(): bool {
+    only_owner()
+    self.paused = 0
+    emit Unpaused(caller)
+    return true
+  }
+
+  fn rotate_relayer(new_relayer: address): bool {
+    only_owner()
+    require(is_address(new_relayer), "bad relayer")
+    self.relayer = new_relayer
+    return true
+  }
+
+  fn transfer_ownership(new_owner: address): bool {
+    only_owner()
+    require(is_address(new_owner), "bad owner")
+    self.owner = new_owner
+    return true
+  }
+
+  fn update_guardian(new_guardian: address): bool {
+    only_owner()
+    require(is_address(new_guardian), "bad guardian")
+    self.guardian = new_guardian
+    return true
+  }
+
+  fn withdraw_fees(recipient: address, amount: int): bool {
+    only_owner()
+    require(is_address(recipient), "bad recipient")
+    require(amount > 0, "zero")
+    require(self.accumulated_fees >= amount, "not enough fees")
+    self.accumulated_fees = self.accumulated_fees - amount
+    self.public_balances[recipient] = self.public_balances[recipient] + amount
+    self.total_supply_public = self.total_supply_public + amount
+    return true
+  }
+
+  // ---- views ----
+
+  view fn public_balance_of(addr: address): int {
+    return self.public_balances[addr]
+  }
+
+  view fn encrypted_balance_of(addr: address): string {
+    return self.encrypted_balances[addr]
+  }
+
+  view fn has_encrypted_balance(addr: address): int {
+    return self.has_encrypted[addr]
+  }
+
+  view fn get_pool_total(): int {
+    return self.pool_total
+  }
+
+  view fn total_supply(): int {
+    return self.total_supply_public + self.total_supply_encrypted
+  }
+
+  view fn is_burn_credited(burn_id: string): int {
+    return self.credited_burn_ids[burn_id]
+  }
+
+  view fn deposit_status(id: int): int {
+    return self.deposit_statuses[id]
+  }
+
+  view fn deposit_amount(id: int): int {
+    return self.deposit_amounts[id]
+  }
+
+  view fn deposit_recipient(id: int): address {
+    return self.deposit_recipients[id]
+  }
+
+  view fn withdraw_status(id: int): int {
+    return self.withdraw_statuses[id]
+  }
+
+  view fn withdraw_amount(id: int): int {
+    return self.withdraw_amounts[id]
+  }
+
+  view fn withdraw_eth_recipient(id: int): string {
+    return self.withdraw_eth_recipients[id]
+  }
+
+  view fn withdraw_count(): int {
+    return self.withdraw_count
+  }
+
+  view fn deposit_count(): int {
+    return self.deposit_count
+  }
+
+  view fn is_paused(): int {
+    return self.paused
+  }
+
+  view fn get_accumulated_fees(): int {
+    return self.accumulated_fees
+  }
+
+  view fn get_owner(): address {
+    return self.owner
+  }
+
+  view fn get_relayer(): address {
+    return self.relayer
+  }
+
+  view fn get_guardian(): address {
+    return self.guardian
+  }
+
+  view fn version(): string {
+    return "0.1.0"
+  }
+}

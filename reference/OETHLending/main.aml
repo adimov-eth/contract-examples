@@ -1,0 +1,597 @@
+contract OETHLending {
+
+  const VERSION = "1.0.0"
+
+  const MAX_LTV_BPS = 7500
+  const LIQUIDATION_THRESHOLD_BPS = 8250
+  const LIQUIDATION_BONUS_BPS = 500
+  const LIQUIDATION_PENALTY_BPS = 500
+  const FEE_DENOMINATOR = 10000
+
+  const BASE_BORROW_RATE_BPS = 200
+  const SLOPE1_BPS = 400
+  const SLOPE2_BPS = 6000
+  const OPTIMAL_UTILIZATION_BPS = 8000
+
+  const MIN_COLLATERAL = 1000000000000000
+  const MIN_BORROW = 1000000
+  const EPOCHS_PER_YEAR = 3153600
+  const PRICE_ORACLE_TTL_EPOCHS = 60
+
+  const HEALTH_FACTOR_SCALE = 10000
+
+  state {
+    owner: address
+    guardian: address
+    paused: int
+    reentrancy_lock: int
+
+    vault_contract: address
+    oracle_contract: address
+    insurance_contract: address
+    insurance_is_set: int
+
+    positions_count: int
+    position_owner: map[int]address
+    position_collateral: map[int]int
+    position_debt_principal: map[int]int
+    position_borrow_index: map[int]int
+    position_created_epoch: map[int]int
+    position_active: map[int]int
+
+    user_position_count: map[address]int
+
+    total_collateral: int
+    total_debt: int
+    total_oct_liquidity: int
+
+    borrow_index: int
+    last_index_update_epoch: int
+
+    reserve_factor_bps: int
+    protocol_reserves: int
+
+    liquidation_incentive_bps: int
+    close_factor_bps: int
+
+    max_borrow_cap: int
+    max_collateral_cap: int
+  }
+
+  event PositionOpened(position_id: int, owner: address, collateral: int)
+  event CollateralAdded(position_id: int, amount: int)
+  event CollateralRemoved(position_id: int, amount: int)
+  event Borrowed(position_id: int, amount: int, new_debt: int)
+  event Repaid(position_id: int, amount: int, remaining_debt: int)
+  event Liquidated(position_id: int, liquidator: address, repaid: int, seized: int, bonus: int)
+  event PositionClosed(position_id: int)
+  event RateUpdated(new_rate_bps: int, utilization_bps: int)
+  event ReservesCollected(amount: int)
+  event LiquidityAdded(amount: int)
+  event LiquidityWithdrawn(recipient: address, amount: int)
+  event Paused(by: address)
+  event Unpaused(by: address)
+
+  constructor(
+    guardian_addr: address,
+    vault_addr: address,
+    oracle_addr: address,
+    insurance_addr: address
+  ) {
+    require(is_address(guardian_addr), "bad guardian")
+    require(is_address(vault_addr), "bad vault")
+    require(is_address(oracle_addr), "bad oracle")
+    self.owner = caller
+    self.guardian = guardian_addr
+    self.vault_contract = vault_addr
+    self.oracle_contract = oracle_addr
+    self.insurance_contract = insurance_addr
+    if is_address(insurance_addr) {
+      self.insurance_is_set = 1
+    } else {
+      self.insurance_is_set = 0
+    }
+    self.paused = 0
+    self.reentrancy_lock = 0
+    self.positions_count = 0
+    self.total_collateral = 0
+    self.total_debt = 0
+    self.total_oct_liquidity = 0
+    self.borrow_index = 10000
+    self.last_index_update_epoch = epoch
+    self.reserve_factor_bps = 1000
+    self.protocol_reserves = 0
+    self.liquidation_incentive_bps = LIQUIDATION_BONUS_BPS
+    self.close_factor_bps = 5000
+    self.max_borrow_cap = 0
+    self.max_collateral_cap = 0
+  }
+
+  private fn only_owner() {
+    require(caller == self.owner, "not owner")
+  }
+
+  private fn only_guardian() {
+    require(caller == self.guardian, "not guardian")
+  }
+
+  private fn not_paused() {
+    require(self.paused == 0, "paused")
+  }
+
+  private fn no_reentry() {
+    require(self.reentrancy_lock == 0, "reentrant")
+    self.reentrancy_lock = 1
+  }
+
+  private fn release_reentry() {
+    self.reentrancy_lock = 0
+  }
+
+  private fn get_eth_oct_price(): int {
+    return call(self.oracle_contract, "get_price_with_ttl", PRICE_ORACLE_TTL_EPOCHS)
+  }
+
+  private fn accrue_interest() {
+    let now_epoch = epoch
+    let delta = now_epoch - self.last_index_update_epoch
+    if delta == 0 {
+      return
+    }
+    let util = utilization_bps_internal()
+    let rate = borrow_rate_bps_internal(util)
+    let interest_factor = rate * delta / EPOCHS_PER_YEAR
+    let new_index = self.borrow_index + (self.borrow_index * interest_factor / FEE_DENOMINATOR)
+    self.borrow_index = new_index
+    self.last_index_update_epoch = now_epoch
+    emit RateUpdated(rate, util)
+  }
+
+  private fn utilization_bps_internal(): int {
+    if self.total_oct_liquidity == 0 {
+      return 0
+    }
+    let total_avail = self.total_oct_liquidity + self.total_debt
+    if total_avail == 0 {
+      return 0
+    }
+    return self.total_debt * 10000 / total_avail
+  }
+
+  private fn borrow_rate_bps_internal(util: int): int {
+    if util <= OPTIMAL_UTILIZATION_BPS {
+      return BASE_BORROW_RATE_BPS + (util * SLOPE1_BPS / OPTIMAL_UTILIZATION_BPS)
+    }
+    let excess = util - OPTIMAL_UTILIZATION_BPS
+    let max_excess = 10000 - OPTIMAL_UTILIZATION_BPS
+    if max_excess == 0 {
+      return BASE_BORROW_RATE_BPS + SLOPE1_BPS + SLOPE2_BPS
+    }
+    return BASE_BORROW_RATE_BPS + SLOPE1_BPS + (excess * SLOPE2_BPS / max_excess)
+  }
+
+  private fn current_debt(position_id: int): int {
+    let principal = self.position_debt_principal[position_id]
+    let pos_idx = self.position_borrow_index[position_id]
+    if principal == 0 || pos_idx == 0 {
+      return 0
+    }
+    return principal * self.borrow_index / pos_idx
+  }
+
+  private fn collateral_value_in_oct(collateral_eth: int): int {
+    let price = get_eth_oct_price()
+    return collateral_eth * price / 1000000000000000000
+  }
+
+  private fn health_factor_internal(position_id: int): int {
+    let debt = current_debt(position_id)
+    if debt == 0 {
+      return 1000000000
+    }
+    let coll = self.position_collateral[position_id]
+    let coll_value_oct = collateral_value_in_oct(coll)
+    let threshold_value = coll_value_oct * LIQUIDATION_THRESHOLD_BPS / FEE_DENOMINATOR
+    return threshold_value * HEALTH_FACTOR_SCALE / debt
+  }
+
+  fn open_position(collateral_amount: int): int {
+    not_paused()
+    no_reentry()
+    accrue_interest()
+    require(collateral_amount >= MIN_COLLATERAL, "below min collateral")
+    if self.max_collateral_cap > 0 {
+      require(self.total_collateral + collateral_amount <= self.max_collateral_cap, "collateral cap")
+    }
+    let ok = call(self.vault_contract, "lock_collateral", caller, collateral_amount)
+    require(ok, "vault lock failed")
+    self.positions_count += 1
+    let pid = self.positions_count
+    self.position_owner[pid] = caller
+    self.position_collateral[pid] = collateral_amount
+    self.position_debt_principal[pid] = 0
+    self.position_borrow_index[pid] = self.borrow_index
+    self.position_created_epoch[pid] = epoch
+    self.position_active[pid] = 1
+    self.user_position_count[caller] += 1
+    self.total_collateral += collateral_amount
+    emit PositionOpened(pid, caller, collateral_amount)
+    release_reentry()
+    return pid
+  }
+
+  fn add_collateral(position_id: int, amount: int): bool {
+    not_paused()
+    no_reentry()
+    accrue_interest()
+    require(self.position_active[position_id] == 1, "inactive")
+    require(self.position_owner[position_id] == caller, "not owner")
+    require(amount > 0, "zero amount")
+    if self.max_collateral_cap > 0 {
+      require(self.total_collateral + amount <= self.max_collateral_cap, "collateral cap")
+    }
+    let ok = call(self.vault_contract, "lock_collateral", caller, amount)
+    require(ok, "vault lock failed")
+    self.position_collateral[position_id] += amount
+    self.total_collateral += amount
+    emit CollateralAdded(position_id, amount)
+    release_reentry()
+    return true
+  }
+
+  fn remove_collateral(position_id: int, amount: int): bool {
+    not_paused()
+    no_reentry()
+    accrue_interest()
+    require(self.position_active[position_id] == 1, "inactive")
+    require(self.position_owner[position_id] == caller, "not owner")
+    require(amount > 0, "zero amount")
+    require(self.position_collateral[position_id] >= amount, "insufficient collateral")
+
+    let new_coll = self.position_collateral[position_id] - amount
+    let debt = current_debt(position_id)
+    if debt > 0 {
+      let new_value = collateral_value_in_oct(new_coll)
+      let max_debt = new_value * MAX_LTV_BPS / FEE_DENOMINATOR
+      require(debt <= max_debt, "ltv breach")
+    }
+    self.position_collateral[position_id] = new_coll
+    self.total_collateral -= amount
+    let ok = call(self.vault_contract, "release_collateral", caller, amount)
+    require(ok, "vault release failed")
+    emit CollateralRemoved(position_id, amount)
+    release_reentry()
+    return true
+  }
+
+  fn borrow(position_id: int, oct_amount: int): bool {
+    not_paused()
+    no_reentry()
+    accrue_interest()
+    require(self.position_active[position_id] == 1, "inactive")
+    require(self.position_owner[position_id] == caller, "not owner")
+    require(oct_amount >= MIN_BORROW, "below min borrow")
+    require(self.total_oct_liquidity >= oct_amount, "insufficient pool liquidity")
+    if self.max_borrow_cap > 0 {
+      require(self.total_debt + oct_amount <= self.max_borrow_cap, "borrow cap")
+    }
+    let current = current_debt(position_id)
+    let new_debt = current + oct_amount
+    let coll_value_oct = collateral_value_in_oct(self.position_collateral[position_id])
+    let max_debt = coll_value_oct * MAX_LTV_BPS / FEE_DENOMINATOR
+    require(new_debt <= max_debt, "ltv exceeded")
+
+    self.position_debt_principal[position_id] = new_debt * 10000 / self.borrow_index * self.borrow_index / 10000
+    self.position_borrow_index[position_id] = self.borrow_index
+    self.total_debt += oct_amount
+    self.total_oct_liquidity -= oct_amount
+
+    transfer(caller, oct_amount)
+    emit Borrowed(position_id, oct_amount, new_debt)
+    release_reentry()
+    return true
+  }
+
+  fn repay(position_id: int, oct_amount: int): bool {
+    not_paused()
+    no_reentry()
+    accrue_interest()
+    require(self.position_active[position_id] == 1, "inactive")
+    require(value == oct_amount, "value mismatch")
+    require(oct_amount > 0, "zero amount")
+    let debt = current_debt(position_id)
+    require(debt > 0, "no debt")
+    let pay = oct_amount
+    if pay > debt {
+      pay = debt
+      transfer(caller, oct_amount - debt)
+    }
+
+    let remaining = debt - pay
+    let new_principal = 0
+    if remaining > 0 {
+      new_principal = remaining * 10000 / self.borrow_index * self.borrow_index / 10000
+    }
+    self.position_debt_principal[position_id] = new_principal
+    self.position_borrow_index[position_id] = self.borrow_index
+
+    let interest_portion = 0
+    let reserve_share = 0
+    if pay > self.position_debt_principal[position_id] {
+      interest_portion = pay - (debt - self.position_debt_principal[position_id])
+    }
+    reserve_share = pay * self.reserve_factor_bps / FEE_DENOMINATOR
+    self.protocol_reserves += reserve_share
+    self.total_oct_liquidity += (pay - reserve_share)
+    self.total_debt -= pay
+
+    emit Repaid(position_id, pay, remaining)
+    release_reentry()
+    return true
+  }
+
+  fn close_position(position_id: int): bool {
+    not_paused()
+    no_reentry()
+    accrue_interest()
+    require(self.position_active[position_id] == 1, "inactive")
+    require(self.position_owner[position_id] == caller, "not owner")
+    require(current_debt(position_id) == 0, "debt remains")
+    let coll = self.position_collateral[position_id]
+    self.position_active[position_id] = 0
+    self.position_collateral[position_id] = 0
+    self.total_collateral -= coll
+    self.user_position_count[caller] -= 1
+    let ok = call(self.vault_contract, "release_collateral", caller, coll)
+    require(ok, "vault release failed")
+    emit PositionClosed(position_id)
+    release_reentry()
+    return true
+  }
+
+  fn liquidate(position_id: int, repay_oct: int): bool {
+    not_paused()
+    no_reentry()
+    accrue_interest()
+    require(self.position_active[position_id] == 1, "inactive")
+    require(value == repay_oct, "value mismatch")
+    require(repay_oct > 0, "zero amount")
+
+    let hf = health_factor_internal(position_id)
+    require(hf < HEALTH_FACTOR_SCALE, "not liquidatable")
+
+    let debt = current_debt(position_id)
+    let max_close = debt * self.close_factor_bps / FEE_DENOMINATOR
+    let pay = repay_oct
+    if pay > max_close {
+      pay = max_close
+      transfer(caller, repay_oct - pay)
+    }
+
+    let price = get_eth_oct_price()
+    let bonus_bps = self.liquidation_incentive_bps
+    let collateral_value_for_repay = pay * 1000000000000000000 / price
+    let seize_amount = collateral_value_for_repay + (collateral_value_for_repay * bonus_bps / FEE_DENOMINATOR)
+
+    if seize_amount > self.position_collateral[position_id] {
+      seize_amount = self.position_collateral[position_id]
+    }
+
+    let new_principal_debt = debt - pay
+    if new_principal_debt > 0 {
+      self.position_debt_principal[position_id] = new_principal_debt * 10000 / self.borrow_index * self.borrow_index / 10000
+    } else {
+      self.position_debt_principal[position_id] = 0
+    }
+    self.position_borrow_index[position_id] = self.borrow_index
+    self.position_collateral[position_id] -= seize_amount
+    self.total_collateral -= seize_amount
+    self.total_debt -= pay
+    self.total_oct_liquidity += pay
+
+    let penalty = seize_amount * LIQUIDATION_PENALTY_BPS / FEE_DENOMINATOR
+    let to_liquidator = seize_amount - penalty
+
+    let ok1 = call(self.vault_contract, "seize_collateral", self.position_owner[position_id], caller, to_liquidator)
+    require(ok1, "seize to liquidator failed")
+
+    if penalty > 0 && self.insurance_is_set == 1 {
+      let ok2 = call(self.vault_contract, "seize_collateral", self.position_owner[position_id], self.insurance_contract, penalty)
+      require(ok2, "seize to insurance failed")
+    }
+
+    emit Liquidated(position_id, caller, pay, seize_amount, seize_amount - collateral_value_for_repay)
+    release_reentry()
+    return true
+  }
+
+  fn add_liquidity(): bool {
+    not_paused()
+    require(value > 0, "zero deposit")
+    self.total_oct_liquidity += value
+    emit LiquidityAdded(value)
+    return true
+  }
+
+  fn withdraw_liquidity(recipient: address, amount: int): bool {
+    only_owner()
+    require(is_address(recipient), "bad recipient")
+    require(amount > 0, "zero amount")
+    require(self.total_oct_liquidity >= amount, "insufficient")
+    self.total_oct_liquidity -= amount
+    transfer(recipient, amount)
+    emit LiquidityWithdrawn(recipient, amount)
+    return true
+  }
+
+  fn collect_reserves(recipient: address, amount: int): bool {
+    only_owner()
+    require(is_address(recipient), "bad recipient")
+    require(amount > 0, "zero amount")
+    require(self.protocol_reserves >= amount, "insufficient reserves")
+    self.protocol_reserves -= amount
+    transfer(recipient, amount)
+    emit ReservesCollected(amount)
+    return true
+  }
+
+  fn set_oracle(new_oracle: address): bool {
+    only_owner()
+    require(is_address(new_oracle), "bad addr")
+    self.oracle_contract = new_oracle
+    return true
+  }
+
+  fn set_vault(new_vault: address): bool {
+    only_owner()
+    require(is_address(new_vault), "bad addr")
+    self.vault_contract = new_vault
+    return true
+  }
+
+  fn set_insurance(new_ins: address): bool {
+    only_owner()
+    require(is_address(new_ins), "bad addr")
+    self.insurance_contract = new_ins
+    self.insurance_is_set = 1
+    return true
+  }
+
+  fn set_reserve_factor(bps: int): bool {
+    only_owner()
+    require(bps >= 0, "negative")
+    require(bps <= 5000, "too high")
+    self.reserve_factor_bps = bps
+    return true
+  }
+
+  fn set_liquidation_incentive(bps: int): bool {
+    only_owner()
+    require(bps >= 0, "negative")
+    require(bps <= 2000, "too high")
+    self.liquidation_incentive_bps = bps
+    return true
+  }
+
+  fn set_close_factor(bps: int): bool {
+    only_owner()
+    require(bps > 0, "zero")
+    require(bps <= 10000, "too high")
+    self.close_factor_bps = bps
+    return true
+  }
+
+  fn set_borrow_cap(cap: int): bool {
+    only_owner()
+    require(cap >= 0, "negative")
+    self.max_borrow_cap = cap
+    return true
+  }
+
+  fn set_collateral_cap(cap: int): bool {
+    only_owner()
+    require(cap >= 0, "negative")
+    self.max_collateral_cap = cap
+    return true
+  }
+
+  fn pause(): bool {
+    only_guardian()
+    self.paused = 1
+    emit Paused(caller)
+    return true
+  }
+
+  fn unpause(): bool {
+    only_owner()
+    self.paused = 0
+    emit Unpaused(caller)
+    return true
+  }
+
+  view fn health_factor(position_id: int): int {
+    return health_factor_internal(position_id)
+  }
+
+  view fn ltv_of(position_id: int): int {
+    let debt = current_debt(position_id)
+    if debt == 0 {
+      return 0
+    }
+    let coll_val = collateral_value_in_oct(self.position_collateral[position_id])
+    if coll_val == 0 {
+      return 999999
+    }
+    return debt * 10000 / coll_val
+  }
+
+  view fn position_owner_of(position_id: int): address {
+    return self.position_owner[position_id]
+  }
+
+  view fn position_collateral_of(position_id: int): int {
+    return self.position_collateral[position_id]
+  }
+
+  view fn position_debt_of(position_id: int): int {
+    return current_debt(position_id)
+  }
+
+  view fn global_debt(): int {
+    return self.total_debt
+  }
+
+  view fn global_liquidity(): int {
+    return self.total_oct_liquidity
+  }
+
+  view fn utilization(): int {
+    return utilization_bps_internal()
+  }
+
+  view fn borrow_rate(): int {
+    let u = utilization_bps_internal()
+    return borrow_rate_bps_internal(u)
+  }
+
+  view fn get_borrow_index(): int {
+    return self.borrow_index
+  }
+
+  view fn get_protocol_reserves(): int {
+    return self.protocol_reserves
+  }
+
+  view fn is_liquidatable(position_id: int): int {
+    let hf = health_factor_internal(position_id)
+    if hf < HEALTH_FACTOR_SCALE {
+      return 1
+    }
+    return 0
+  }
+
+  view fn get_position_count(): int {
+    return self.positions_count
+  }
+
+  view fn get_user_position_count(addr: address): int {
+    return self.user_position_count[addr]
+  }
+
+  view fn get_config(): string {
+    let s = to_string(MAX_LTV_BPS)
+    s = concat(s, ",")
+    s = concat(s, to_string(LIQUIDATION_THRESHOLD_BPS))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.liquidation_incentive_bps))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.close_factor_bps))
+    s = concat(s, ",")
+    s = concat(s, to_string(self.reserve_factor_bps))
+    return s
+  }
+
+  view fn version(): string {
+    return VERSION
+  }
+}

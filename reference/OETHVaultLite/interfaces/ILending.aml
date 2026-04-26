@@ -1,0 +1,19 @@
+interface ILending {
+  fn open_position(collateral_amount: int): int
+  fn add_collateral(position_id: int, amount: int): bool
+  fn remove_collateral(position_id: int, amount: int): bool
+  fn borrow(position_id: int, oct_amount: int): bool
+  fn repay(position_id: int, oct_amount: int): bool
+  fn close_position(position_id: int): bool
+
+  fn liquidate(position_id: int, repay_oct: int): bool
+  fn health_factor(position_id: int): int
+
+  view fn ltv_of(position_id: int): int
+  view fn position_owner(position_id: int): address
+  view fn position_collateral(position_id: int): int
+  view fn position_debt(position_id: int): int
+  view fn global_debt(): int
+  view fn utilization(): int
+  view fn borrow_rate(): int
+}

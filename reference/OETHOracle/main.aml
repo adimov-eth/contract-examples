@@ -1,0 +1,268 @@
+contract OETHOracle {
+
+  const VERSION = "1.0.0"
+  const PRICE_DECIMALS = 8
+  const MAX_STALENESS_EPOCHS = 60
+  const MIN_SIGNERS = 1
+  const MAX_SIGNERS = 16
+  const MAX_DEVIATION_BPS = 1000
+  const EPOCH_BUCKET_SIZE = 8640
+
+  state {
+    owner: address
+    guardian: address
+    paused: int
+
+    signers: map[address]int
+    signer_count: int
+    quorum: int
+
+    eth_oct_price: int
+    eth_usd_price: int
+    oct_usd_price: int
+    last_update_epoch: int
+
+    round_id: int
+    round_prices_eth_oct: map[int]int
+    round_prices_eth_usd: map[int]int
+    round_prices_oct_usd: map[int]int
+
+    submission_nonce: map[address]int
+    round_submissions: map[int]map[address]int
+
+    price_history_eth_oct: map[int]int
+    price_history_eth_usd: map[int]int
+    history_window_epochs: int
+
+    deviation_breach_count: int
+    last_breach_epoch: int
+  }
+
+  event PriceUpdated(round_id: int, eth_oct: int, eth_usd: int, oct_usd: int, epoch_num: int)
+  event SignerAdded(signer: address)
+  event SignerRemoved(signer: address)
+  event QuorumChanged(old_q: int, new_q: int)
+  event DeviationBreach(round_id: int, old_price: int, new_price: int, bps_delta: int)
+  event Paused(by: address)
+  event Unpaused(by: address)
+
+  constructor(guardian_addr: address, init_signer: address, init_eth_oct: int, init_eth_usd: int, init_oct_usd: int) {
+    require(is_address(guardian_addr), "invalid guardian")
+    require(is_address(init_signer), "invalid signer")
+    require(init_eth_oct > 0, "zero eth_oct")
+    require(init_eth_usd > 0, "zero eth_usd")
+    require(init_oct_usd > 0, "zero oct_usd")
+    self.owner = caller
+    self.guardian = guardian_addr
+    self.paused = 0
+    self.signers[init_signer] = 1
+    self.signer_count = 1
+    self.quorum = 1
+    self.eth_oct_price = init_eth_oct
+    self.eth_usd_price = init_eth_usd
+    self.oct_usd_price = init_oct_usd
+    self.last_update_epoch = epoch
+    self.round_id = 0
+    self.history_window_epochs = 2880
+    self.deviation_breach_count = 0
+    self.last_breach_epoch = 0
+    emit SignerAdded(init_signer)
+  }
+
+  private fn only_owner() {
+    require(caller == self.owner, "not owner")
+  }
+
+  private fn only_guardian() {
+    require(caller == self.guardian, "not guardian")
+  }
+
+  private fn only_signer() {
+    require(self.signers[caller] == 1, "not signer")
+  }
+
+  private fn not_paused() {
+    require(self.paused == 0, "paused")
+  }
+
+  private fn abs_bps_delta(old_p: int, new_p: int): int {
+    if old_p == 0 {
+      return 0
+    }
+    let diff = new_p - old_p
+    if diff < 0 {
+      diff = 0 - diff
+    }
+    return diff * 10000 / old_p
+  }
+
+  fn submit_price(new_eth_oct: int, new_eth_usd: int, new_oct_usd: int, nonce: int): bool {
+    only_signer()
+    not_paused()
+    require(new_eth_oct > 0, "zero eth_oct")
+    require(new_eth_usd > 0, "zero eth_usd")
+    require(new_oct_usd > 0, "zero oct_usd")
+    require(nonce > self.submission_nonce[caller], "stale nonce")
+
+    self.submission_nonce[caller] = nonce
+
+    let rid = self.round_id
+    require(self.round_submissions[rid][caller] == 0, "already submitted this round")
+    self.round_submissions[rid][caller] = 1
+
+    self.round_prices_eth_oct[rid] += new_eth_oct
+    self.round_prices_eth_usd[rid] += new_eth_usd
+    self.round_prices_oct_usd[rid] += new_oct_usd
+
+    let total_submissions = 0
+    for i in 0..self.signer_count {
+      total_submissions += 0
+    }
+
+    return true
+  }
+
+  fn finalize_round(submission_count: int): bool {
+    only_owner()
+    not_paused()
+    let rid = self.round_id
+    require(submission_count >= self.quorum, "below quorum")
+    require(submission_count <= self.signer_count, "too many")
+
+    let avg_eth_oct = self.round_prices_eth_oct[rid] / submission_count
+    let avg_eth_usd = self.round_prices_eth_usd[rid] / submission_count
+    let avg_oct_usd = self.round_prices_oct_usd[rid] / submission_count
+
+    let d1 = abs_bps_delta(self.eth_oct_price, avg_eth_oct)
+    let d2 = abs_bps_delta(self.eth_usd_price, avg_eth_usd)
+
+    if self.eth_oct_price > 0 && d1 > MAX_DEVIATION_BPS {
+      self.deviation_breach_count += 1
+      self.last_breach_epoch = epoch
+      emit DeviationBreach(rid, self.eth_oct_price, avg_eth_oct, d1)
+      if self.deviation_breach_count < 3 {
+        self.round_id += 1
+        return false
+      }
+    }
+    if self.eth_usd_price > 0 && d2 > MAX_DEVIATION_BPS {
+      self.deviation_breach_count += 1
+      self.last_breach_epoch = epoch
+      emit DeviationBreach(rid, self.eth_usd_price, avg_eth_usd, d2)
+      if self.deviation_breach_count < 3 {
+        self.round_id += 1
+        return false
+      }
+    }
+
+    self.eth_oct_price = avg_eth_oct
+    self.eth_usd_price = avg_eth_usd
+    self.oct_usd_price = avg_oct_usd
+    self.last_update_epoch = epoch
+
+    self.price_history_eth_oct[epoch] = avg_eth_oct
+    self.price_history_eth_usd[epoch] = avg_eth_usd
+
+    self.round_id += 1
+    self.deviation_breach_count = 0
+
+    emit PriceUpdated(rid, avg_eth_oct, avg_eth_usd, avg_oct_usd, epoch)
+    return true
+  }
+
+  fn add_signer(addr: address): bool {
+    only_owner()
+    require(is_address(addr), "invalid")
+    require(self.signers[addr] == 0, "already signer")
+    require(self.signer_count < MAX_SIGNERS, "max signers")
+    self.signers[addr] = 1
+    self.signer_count += 1
+    emit SignerAdded(addr)
+    return true
+  }
+
+  fn remove_signer(addr: address): bool {
+    only_owner()
+    require(self.signers[addr] == 1, "not signer")
+    require(self.signer_count > self.quorum, "below quorum after remove")
+    self.signers[addr] = 0
+    self.signer_count -= 1
+    emit SignerRemoved(addr)
+    return true
+  }
+
+  fn set_quorum(new_q: int): bool {
+    only_owner()
+    require(new_q >= MIN_SIGNERS, "too low")
+    require(new_q <= self.signer_count, "above signer count")
+    let old = self.quorum
+    self.quorum = new_q
+    emit QuorumChanged(old, new_q)
+    return true
+  }
+
+  fn pause(): bool {
+    only_guardian()
+    self.paused = 1
+    emit Paused(caller)
+    return true
+  }
+
+  fn unpause(): bool {
+    only_owner()
+    self.paused = 0
+    emit Unpaused(caller)
+    return true
+  }
+
+  view fn get_eth_oct_price(): int {
+    return self.eth_oct_price
+  }
+
+  view fn get_eth_usd_price(): int {
+    return self.eth_usd_price
+  }
+
+  view fn get_oct_usd_price(): int {
+    return self.oct_usd_price
+  }
+
+  view fn last_update_epoch(): int {
+    return self.last_update_epoch
+  }
+
+  view fn is_fresh(max_staleness_epochs: int): int {
+    let age = epoch - self.last_update_epoch
+    if age > max_staleness_epochs {
+      return 0
+    }
+    return 1
+  }
+
+  view fn get_price_with_ttl(ttl_epochs: int): int {
+    let age = epoch - self.last_update_epoch
+    require(age <= ttl_epochs, "price stale")
+    require(self.paused == 0, "oracle paused")
+    return self.eth_oct_price
+  }
+
+  view fn is_signer(addr: address): int {
+    return self.signers[addr]
+  }
+
+  view fn version(): string {
+    return VERSION
+  }
+
+  view fn get_round_id(): int {
+    return self.round_id
+  }
+
+  view fn get_deviation_breach_count(): int {
+    return self.deviation_breach_count
+  }
+
+  view fn historical_price(at_epoch: int): int {
+    return self.price_history_eth_oct[at_epoch]
+  }
+}

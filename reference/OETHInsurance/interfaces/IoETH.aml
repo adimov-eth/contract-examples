@@ -1,0 +1,19 @@
+interface IoETH {
+  fn transfer(to: address, amount: int): bool
+  fn transfer_from(from: address, to: address, amount: int): bool
+  fn approve(spender: address, amount: int): bool
+  fn balance_of(addr: address): int
+  fn allowance(owner: address, spender: address): int
+  fn total_supply(): int
+
+  fn shield(amount: int): bool
+  fn unshield(ct_amount: string, range_proof: string, amount: int): bool
+  fn private_transfer(to: address, ct_amount: string): bool
+  fn encrypted_balance_of(addr: address): string
+
+  fn burn_to_ethereum(eth_recipient: string, amount: int): bool
+
+  fn lock_collateral(owner: address, amount: int): bool
+  fn release_collateral(owner: address, amount: int): bool
+  fn seize_collateral(owner: address, recipient: address, amount: int): bool
+}

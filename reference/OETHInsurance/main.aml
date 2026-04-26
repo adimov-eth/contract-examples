@@ -1,0 +1,451 @@
+contract OETHInsurance {
+
+  const VERSION = "1.0.0"
+
+  const EPOCHS_PER_DAY = 8640
+  const REWARD_PRECISION = 1000000000000
+  const MIN_STAKE = 1000000000000000
+  const UNSTAKE_COOLDOWN_EPOCHS = 86400
+  const SLASH_CAP_BPS = 3000
+  const FEE_DENOMINATOR = 10000
+
+  state {
+    owner: address
+    guardian: address
+    paused: int
+    reentrancy_lock: int
+
+    vault_contract: address
+    lending_contract: address
+    bridge_contract: address
+
+    total_staked: int
+    total_shares: int
+    shares: map[address]int
+    stake_epoch: map[address]int
+
+    reward_per_share_acc: int
+    reward_debt: map[address]int
+
+    pending_unstakes: map[address]int
+    unstake_unlock_epoch: map[address]int
+
+    fee_income_total: int
+    fee_income_distributed: int
+
+    last_accrual_epoch: int
+
+    slash_count: int
+    slashed_total: int
+    slash_history: map[int]int
+
+    cooldown_epochs: int
+    emergency_unstake_penalty_bps: int
+  }
+
+  event Staked(staker: address, amount: int, shares_minted: int)
+  event UnstakeRequested(staker: address, shares: int, unlock_epoch: int)
+  event UnstakeFinalized(staker: address, amount: int)
+  event EmergencyUnstake(staker: address, amount: int, penalty: int)
+  event RewardsClaimed(staker: address, amount: int)
+  event FeeIncomeNotified(amount: int, new_rps: int)
+  event Slashed(amount: int, recipient: address, new_total_staked: int)
+  event Paused(by: address)
+  event Unpaused(by: address)
+  event ConfigChanged(key: string, new_val: int)
+
+  constructor(
+    guardian_addr: address,
+    vault_addr: address,
+    bridge_addr: address
+  ) {
+    require(is_address(guardian_addr), "bad guardian")
+    require(is_address(vault_addr), "bad vault")
+    self.owner = caller
+    self.guardian = guardian_addr
+    self.vault_contract = vault_addr
+    self.bridge_contract = bridge_addr
+    self.paused = 0
+    self.reentrancy_lock = 0
+    self.total_staked = 0
+    self.total_shares = 0
+    self.reward_per_share_acc = 0
+    self.fee_income_total = 0
+    self.fee_income_distributed = 0
+    self.last_accrual_epoch = epoch
+    self.slash_count = 0
+    self.slashed_total = 0
+    self.cooldown_epochs = UNSTAKE_COOLDOWN_EPOCHS
+    self.emergency_unstake_penalty_bps = 1000
+  }
+
+  private fn only_owner() {
+    require(caller == self.owner, "not owner")
+  }
+
+  private fn only_guardian() {
+    require(caller == self.guardian, "not guardian")
+  }
+
+  private fn only_bridge() {
+    require(caller == self.bridge_contract, "not bridge")
+  }
+
+  private fn only_vault_or_lending() {
+    require(caller == self.vault_contract || caller == self.lending_contract, "not authorized")
+  }
+
+  private fn not_paused() {
+    require(self.paused == 0, "paused")
+  }
+
+  private fn no_reentry() {
+    require(self.reentrancy_lock == 0, "reentrant")
+    self.reentrancy_lock = 1
+  }
+
+  private fn release_reentry() {
+    self.reentrancy_lock = 0
+  }
+
+  private fn share_value(): int {
+    if self.total_shares == 0 {
+      return REWARD_PRECISION
+    }
+    return self.total_staked * REWARD_PRECISION / self.total_shares
+  }
+
+  private fn calc_pending(staker: address): int {
+    let accumulated = self.shares[staker] * self.reward_per_share_acc / REWARD_PRECISION
+    if accumulated < self.reward_debt[staker] {
+      return 0
+    }
+    return accumulated - self.reward_debt[staker]
+  }
+
+  fn stake(amount: int): bool {
+    not_paused()
+    no_reentry()
+    require(amount >= MIN_STAKE, "below min")
+
+    let ok = call(self.vault_contract, "transfer_from", caller, self_addr, amount)
+    require(ok, "vault pull failed")
+
+    let pending = calc_pending(caller)
+    if pending > 0 {
+      transfer(caller, pending)
+      emit RewardsClaimed(caller, pending)
+    }
+
+    let minted_shares = 0
+    if self.total_shares == 0 {
+      minted_shares = amount
+    } else {
+      minted_shares = amount * self.total_shares / self.total_staked
+    }
+    require(minted_shares > 0, "zero shares")
+
+    self.shares[caller] += minted_shares
+    self.total_shares += minted_shares
+    self.total_staked += amount
+    self.stake_epoch[caller] = epoch
+    self.reward_debt[caller] = self.shares[caller] * self.reward_per_share_acc / REWARD_PRECISION
+
+    emit Staked(caller, amount, minted_shares)
+    release_reentry()
+    return true
+  }
+
+  fn request_unstake(shares_to_burn: int): bool {
+    not_paused()
+    no_reentry()
+    require(shares_to_burn > 0, "zero shares")
+    require(self.shares[caller] >= shares_to_burn, "insufficient shares")
+    require(self.pending_unstakes[caller] == 0, "unstake pending")
+
+    let pending = calc_pending(caller)
+    if pending > 0 {
+      transfer(caller, pending)
+      emit RewardsClaimed(caller, pending)
+    }
+
+    let amount_out = shares_to_burn * self.total_staked / self.total_shares
+    require(amount_out > 0, "zero amount")
+
+    self.shares[caller] -= shares_to_burn
+    self.total_shares -= shares_to_burn
+    self.total_staked -= amount_out
+    self.pending_unstakes[caller] = amount_out
+    self.unstake_unlock_epoch[caller] = epoch + self.cooldown_epochs
+    self.reward_debt[caller] = self.shares[caller] * self.reward_per_share_acc / REWARD_PRECISION
+
+    emit UnstakeRequested(caller, shares_to_burn, self.unstake_unlock_epoch[caller])
+    release_reentry()
+    return true
+  }
+
+  fn finalize_unstake(): bool {
+    not_paused()
+    no_reentry()
+    let amount = self.pending_unstakes[caller]
+    require(amount > 0, "nothing pending")
+    require(epoch >= self.unstake_unlock_epoch[caller], "cooldown active")
+
+    self.pending_unstakes[caller] = 0
+    self.unstake_unlock_epoch[caller] = 0
+
+    let ok = call(self.vault_contract, "transfer", caller, amount)
+    require(ok, "vault transfer failed")
+
+    emit UnstakeFinalized(caller, amount)
+    release_reentry()
+    return true
+  }
+
+  fn emergency_unstake(shares_to_burn: int): bool {
+    not_paused()
+    no_reentry()
+    require(shares_to_burn > 0, "zero shares")
+    require(self.shares[caller] >= shares_to_burn, "insufficient shares")
+
+    let pending = calc_pending(caller)
+    if pending > 0 {
+      transfer(caller, pending)
+      emit RewardsClaimed(caller, pending)
+    }
+
+    let amount_gross = shares_to_burn * self.total_staked / self.total_shares
+    let penalty = amount_gross * self.emergency_unstake_penalty_bps / FEE_DENOMINATOR
+    let amount_net = amount_gross - penalty
+
+    self.shares[caller] -= shares_to_burn
+    self.total_shares -= shares_to_burn
+    self.total_staked -= amount_gross
+    self.reward_debt[caller] = self.shares[caller] * self.reward_per_share_acc / REWARD_PRECISION
+
+    let ok = call(self.vault_contract, "transfer", caller, amount_net)
+    require(ok, "vault transfer failed")
+
+    if penalty > 0 && self.total_shares > 0 {
+      self.total_staked += penalty
+    }
+
+    emit EmergencyUnstake(caller, amount_net, penalty)
+    release_reentry()
+    return true
+  }
+
+  fn claim_rewards(): bool {
+    not_paused()
+    no_reentry()
+    let pending = calc_pending(caller)
+    require(pending > 0, "nothing to claim")
+    self.reward_debt[caller] = self.shares[caller] * self.reward_per_share_acc / REWARD_PRECISION
+    self.fee_income_distributed += pending
+    transfer(caller, pending)
+    emit RewardsClaimed(caller, pending)
+    release_reentry()
+    return true
+  }
+
+  fn notify_fee_income(): bool {
+    require(value > 0, "zero value")
+    not_paused()
+
+    if self.total_shares == 0 {
+      self.fee_income_total += value
+      return true
+    }
+
+    self.fee_income_total += value
+    let rps_add = value * REWARD_PRECISION / self.total_shares
+    self.reward_per_share_acc += rps_add
+    self.last_accrual_epoch = epoch
+
+    emit FeeIncomeNotified(value, self.reward_per_share_acc)
+    return true
+  }
+
+  fn slash(amount: int, recipient: address): bool {
+    only_bridge()
+    require(amount > 0, "zero amount")
+    require(is_address(recipient), "bad recipient")
+    let cap = self.total_staked * SLASH_CAP_BPS / FEE_DENOMINATOR
+    require(amount <= cap, "above slash cap")
+    require(self.total_staked >= amount, "insufficient staked")
+
+    self.total_staked -= amount
+    self.slash_count += 1
+    self.slashed_total += amount
+    self.slash_history[self.slash_count] = amount
+
+    let ok = call(self.vault_contract, "transfer", recipient, amount)
+    require(ok, "vault transfer failed")
+
+    emit Slashed(amount, recipient, self.total_staked)
+    return true
+  }
+
+  fn cover_shortfall(amount: int, recipient: address): bool {
+    only_bridge()
+    require(amount > 0, "zero amount")
+    require(is_address(recipient), "bad recipient")
+    require(self.total_staked >= amount, "insufficient pool")
+
+    self.total_staked -= amount
+    self.slash_count += 1
+    self.slashed_total += amount
+    self.slash_history[self.slash_count] = amount
+
+    let ok = call(self.vault_contract, "transfer", recipient, amount)
+    require(ok, "vault transfer failed")
+
+    emit Slashed(amount, recipient, self.total_staked)
+    return true
+  }
+
+  fn set_lending_contract(c: address): bool {
+    only_owner()
+    require(is_address(c), "bad addr")
+    self.lending_contract = c
+    return true
+  }
+
+  fn set_bridge_contract(c: address): bool {
+    only_owner()
+    require(is_address(c), "bad addr")
+    self.bridge_contract = c
+    return true
+  }
+
+  fn set_cooldown(new_cooldown: int): bool {
+    only_owner()
+    require(new_cooldown >= EPOCHS_PER_DAY, "too short")
+    require(new_cooldown <= EPOCHS_PER_DAY * 30, "too long")
+    self.cooldown_epochs = new_cooldown
+    emit ConfigChanged("cooldown", new_cooldown)
+    return true
+  }
+
+  fn set_emergency_penalty(bps: int): bool {
+    only_owner()
+    require(bps >= 0, "negative")
+    require(bps <= 5000, "too high")
+    self.emergency_unstake_penalty_bps = bps
+    emit ConfigChanged("emergency_penalty", bps)
+    return true
+  }
+
+  fn pause(): bool {
+    only_guardian()
+    self.paused = 1
+    emit Paused(caller)
+    return true
+  }
+
+  fn unpause(): bool {
+    only_owner()
+    self.paused = 0
+    emit Unpaused(caller)
+    return true
+  }
+
+  view fn pending_rewards(addr: address): int {
+    return calc_pending(addr)
+  }
+
+  view fn stake_of(addr: address): int {
+    if self.total_shares == 0 {
+      return 0
+    }
+    return self.shares[addr] * self.total_staked / self.total_shares
+  }
+
+  view fn shares_of(addr: address): int {
+    return self.shares[addr]
+  }
+
+  view fn pending_unstake(addr: address): int {
+    return self.pending_unstakes[addr]
+  }
+
+  view fn unstake_unlock_epoch_of(addr: address): int {
+    return self.unstake_unlock_epoch[addr]
+  }
+
+  view fn is_unstake_ready(addr: address): int {
+    if self.pending_unstakes[addr] == 0 {
+      return 0
+    }
+    if epoch < self.unstake_unlock_epoch[addr] {
+      return 0
+    }
+    return 1
+  }
+
+  view fn total_staked(): int {
+    return self.total_staked
+  }
+
+  view fn total_shares_supply(): int {
+    return self.total_shares
+  }
+
+  view fn share_price(): int {
+    return share_value()
+  }
+
+  view fn reward_per_share(): int {
+    return self.reward_per_share_acc
+  }
+
+  view fn total_fee_income(): int {
+    return self.fee_income_total
+  }
+
+  view fn total_fee_distributed(): int {
+    return self.fee_income_distributed
+  }
+
+  view fn get_slash_count(): int {
+    return self.slash_count
+  }
+
+  view fn get_slashed_total(): int {
+    return self.slashed_total
+  }
+
+  view fn get_slash_at(idx: int): int {
+    return self.slash_history[idx]
+  }
+
+  view fn apr_estimate(days: int): int {
+    if self.total_staked == 0 || self.fee_income_total == 0 {
+      return 0
+    }
+    let days_elapsed = (epoch - 0) / EPOCHS_PER_DAY
+    if days_elapsed == 0 {
+      return 0
+    }
+    return self.fee_income_total * 365 * 10000 / (self.total_staked * days_elapsed)
+  }
+
+  view fn version(): string {
+    return VERSION
+  }
+
+  view fn is_paused(): int {
+    return self.paused
+  }
+
+  view fn get_config(): string {
+    let s = to_string(self.cooldown_epochs)
+    s = concat(s, ",")
+    s = concat(s, to_string(self.emergency_unstake_penalty_bps))
+    s = concat(s, ",")
+    s = concat(s, to_string(SLASH_CAP_BPS))
+    s = concat(s, ",")
+    s = concat(s, to_string(MIN_STAKE))
+    return s
+  }
+}

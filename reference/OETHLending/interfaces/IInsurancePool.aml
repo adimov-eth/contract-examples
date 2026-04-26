@@ -1,0 +1,12 @@
+interface IInsurancePool {
+  fn stake(): bool
+  fn unstake(shares: int): bool
+  fn claim_rewards(): bool
+  fn pending_rewards(addr: address): int
+  fn stake_of(addr: address): int
+  fn total_staked(): int
+
+  fn notify_fee_income(): bool
+  fn slash(amount: int, recipient: address): bool
+  fn cover_shortfall(amount: int, recipient: address): bool
+}

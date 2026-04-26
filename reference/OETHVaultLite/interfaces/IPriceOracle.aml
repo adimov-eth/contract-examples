@@ -1,0 +1,8 @@
+interface IPriceOracle {
+  fn get_eth_oct_price(): int
+  fn get_eth_usd_price(): int
+  fn get_oct_usd_price(): int
+  fn last_update_epoch(): int
+  fn is_fresh(max_staleness_epochs: int): int
+  fn get_price_with_ttl(ttl_epochs: int): int
+}

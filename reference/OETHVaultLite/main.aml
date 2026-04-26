@@ -1,0 +1,873 @@
+contract OETHVaultLite {
+
+  const VERSION = "1.0.0"
+  const SYMBOL = "oETH"
+  const DECIMALS = 18
+
+  const MIN_MINT = 1000000000000000
+  const EPOCHS_PER_DAY = 8640
+  const INITIAL_MAX_MINT_PER_TX = 10000000000000000000
+  const INITIAL_MAX_BURN_PER_TX = 10000000000000000000
+  const INITIAL_DAILY_MINT_CAP = 50000000000000000000
+  const INITIAL_DAILY_BURN_CAP = 50000000000000000000
+  const CAP_CEILING = 1000000000000000000000000
+  const CAP_RAISE_RATIO_BPS = 20000
+
+  const BURN_FEE_BPS = 10
+  const SHIELD_FEE_BPS = 5
+  const UNSHIELD_FEE_BPS = 5
+  const FEE_DENOMINATOR = 10000
+
+  const AMM_SWAP_FEE_BPS = 30
+  const AMM_LP_FEE_SHARE_BPS = 8000
+  const AMM_PROTOCOL_FEE_SHARE_BPS = 2000
+  const AMM_MIN_LIQUIDITY = 1000
+  const AMM_MAX_SLIPPAGE_BPS = 5000
+
+  const YIELD_ACC_PRECISION = 1000000000000
+  const AUTO_STAKE_MIN_HOLD_EPOCHS = 100
+  const AUTO_STAKE_SHARE_BPS = 5000
+
+  const ENC_SAVE_MIN_EPOCHS = 100
+  const ENC_SAVE_APR_BPS = 500
+  const ENC_SAVE_MAX_APR_BPS = 2000
+  const EPOCHS_PER_YEAR = 3153600
+
+  state {
+    owner: address
+    guardian: address
+    bridge_operator: address
+    lending_contract: address
+    lending_is_set: int
+    insurance_contract: address
+    insurance_is_set: int
+    initialized: int
+    paused: int
+    reentrancy_lock: int
+
+    total_supply_public: int
+    total_supply_encrypted: int
+    outstanding_supply: int
+
+    balances: map[address]int
+    allowances: map[address]map[address]int
+
+    encrypted_balances: map[address]string
+    has_encrypted: map[address]int
+
+    collateral_locked: map[address]int
+
+    processed_mint_ids: map[string]int
+    mint_count: int
+    mint_nonce: int
+
+    burn_nonce: int
+    burn_history: map[int]address
+    burn_amounts: map[int]int
+    burn_eth_recipients: map[int]string
+    burn_fees_accumulated: int
+
+    max_mint_per_tx: int
+    max_burn_per_tx: int
+    daily_mint_cap: int
+    daily_burn_cap: int
+    daily_minted: int
+    last_mint_day: int
+    daily_burned: int
+    last_burn_day: int
+    last_cap_update_epoch: int
+
+    user_last_mint_epoch: map[address]int
+
+    signer_set_hash: string
+    quorum: int
+    validator_set_version: int
+
+    encrypted_supply_ct: string
+
+    amm_reserve_oeth: int
+    amm_reserve_oct: int
+    amm_total_shares: int
+    amm_shares: map[address]int
+    amm_accumulated_protocol_fees_oeth: int
+    amm_accumulated_protocol_fees_oct: int
+    amm_total_volume_oeth_in: int
+    amm_total_volume_oct_in: int
+    amm_last_trade_epoch: int
+
+    auto_stake_active: map[address]int
+    auto_stake_start_epoch: map[address]int
+    auto_stake_balance_snapshot: map[address]int
+    auto_stake_reward_debt: map[address]int
+    auto_stake_total_active_balance: int
+    auto_stake_acc_per_unit: int
+    auto_stake_total_distributed: int
+    auto_stake_pending_pool: int
+
+    enc_save_ct: map[address]string
+    enc_save_active: map[address]int
+    enc_save_last_accrual_epoch: map[address]int
+    enc_save_nominal_deposit: map[address]int
+    enc_save_total_deposited_nominal: int
+    enc_save_total_accounts: int
+    enc_save_current_apr_bps: int
+
+    lp_reward_pool_oct: int
+    lp_reward_acc_per_share: int
+    lp_reward_debt: map[address]int
+    lp_last_distribution_epoch: int
+    lp_emission_rate_oct_per_epoch: int
+    lp_total_distributed: int
+    lp_total_funded: int
+    lp_stake_start_epoch: map[address]int
+    lp_bonus_min_hold_epochs: int
+    lp_bonus_multiplier_bps: int
+  }
+
+  event Minted(recipient: address, amount: int, message_id: string, epoch_id: int)
+  event Burned(burner: address, amount: int, eth_recipient: string, burn_id: int)
+  event Transfer(from: address, to: address, amount: int)
+  event Approval(owner: address, spender: address, amount: int)
+  event Shielded(owner: address, amount: int, fee: int)
+  event Unshielded(owner: address, amount: int, fee: int)
+  event PrivateTransfer(from: address, to: address)
+  event CollateralLocked(owner: address, amount: int)
+  event CollateralReleased(owner: address, amount: int)
+  event CollateralSeized(owner: address, recipient: address, amount: int)
+  event Paused(by: address)
+  event Unpaused(by: address)
+  event OperatorChanged(role: string, old_op: address, new_op: address)
+  event FeeCollected(kind: string, amount: int)
+  event ValidatorSetUpdated(new_hash: string, new_quorum: int, version: int)
+  event CapsUpdated(max_mint_tx: int, max_burn_tx: int, daily_mint: int, daily_burn: int)
+
+  event AMMLiquidityAdded(provider: address, oeth_in: int, oct_in: int, shares_minted: int)
+  event AMMLiquidityRemoved(provider: address, oeth_out: int, oct_out: int, shares_burned: int)
+  event AMMSwap(trader: address, oeth_in: int, oct_in: int, oeth_out: int, oct_out: int, fee_oeth: int, fee_oct: int)
+  event AMMReservesSync(reserve_oeth: int, reserve_oct: int, total_shares: int)
+
+  event AutoStakeEnabled(staker: address, balance_snapshot: int)
+  event AutoStakeDisabled(staker: address, realized_reward: int)
+  event AutoStakeRewardsClaimed(staker: address, reward: int)
+  event AutoStakeRewardsDeposited(amount: int, new_acc_per_unit: int)
+
+  event EncSaveDeposit(owner: address, nominal_amount: int, new_active_accounts: int)
+  event EncSaveWithdraw(owner: address, nominal_principal: int, accrued_int_released: int)
+  event EncSaveAccrued(owner: address, delta_epochs: int)
+  event EncSaveAprChanged(old_apr: int, new_apr: int)
+
+  event LPRewardClaimed(staker: address, paid: int, base: int)
+  event LPRewardsFunded(funder: address, amount: int, new_pool: int)
+  event LPEmissionRateChanged(old_rate: int, new_rate: int)
+  event LPBonusChanged(min_hold: int, multiplier_bps: int)
+
+  constructor(guardian_addr: address, bridge_op: address, signer_hash: string, init_quorum: int) {
+    require(is_address(guardian_addr), "invalid guardian")
+    require(is_address(bridge_op), "invalid bridge op")
+    require(len(signer_hash) == 66, "bad signer hash")
+    require(init_quorum > 0, "zero quorum")
+    self.owner = caller
+    self.guardian = guardian_addr
+    self.bridge_operator = bridge_op
+    self.signer_set_hash = signer_hash
+    self.quorum = init_quorum
+    self.validator_set_version = 1
+    self.initialized = 0
+  }
+
+  fn init_defaults(): bool {
+    only_owner()
+    require(self.initialized == 0, "already initialized")
+    self.max_mint_per_tx = INITIAL_MAX_MINT_PER_TX
+    self.max_burn_per_tx = INITIAL_MAX_BURN_PER_TX
+    self.daily_mint_cap = INITIAL_DAILY_MINT_CAP
+    self.daily_burn_cap = INITIAL_DAILY_BURN_CAP
+    self.last_cap_update_epoch = epoch
+    self.enc_save_current_apr_bps = ENC_SAVE_APR_BPS
+    self.lp_last_distribution_epoch = epoch
+    self.lp_bonus_min_hold_epochs = 43200
+    self.lp_bonus_multiplier_bps = 15000
+    self.initialized = 1
+    return true
+  }
+
+  private fn only_owner() {
+    require(caller == self.owner, "not owner")
+  }
+
+  private fn only_guardian() {
+    require(caller == self.guardian, "not guardian")
+  }
+
+  private fn only_bridge_op() {
+    require(caller == self.bridge_operator, "not bridge op")
+  }
+
+  private fn only_lending() {
+    require(self.lending_is_set == 1, "no lending set")
+    require(caller == self.lending_contract, "not lending")
+  }
+
+  private fn not_paused() {
+    require(self.paused == 0, "vault paused")
+  }
+
+  private fn no_reentry() {
+    require(self.reentrancy_lock == 0, "reentrant")
+    self.reentrancy_lock = 1
+  }
+
+  private fn release_reentry() {
+    self.reentrancy_lock = 0
+  }
+
+  private fn reset_daily_mint() {
+    let today = epoch / EPOCHS_PER_DAY
+    if today != self.last_mint_day {
+      self.daily_minted = 0
+      self.last_mint_day = today
+    }
+  }
+
+  private fn reset_daily_burn() {
+    let today = epoch / EPOCHS_PER_DAY
+    if today != self.last_burn_day {
+      self.daily_burned = 0
+      self.last_burn_day = today
+    }
+  }
+
+  private fn validate_eth_address(addr: string) {
+    require(len(addr) == 42, "eth addr len")
+    require(substr(addr, 0, 2) == "0x", "eth addr prefix")
+    require(is_hex(substr(addr, 2, 40)), "eth addr hex")
+  }
+
+  private fn free_balance(owner: address): int {
+    return self.balances[owner] - self.collateral_locked[owner]
+  }
+
+  fn verify_and_mint(
+    recipient: address,
+    amount: int,
+    src_nonce: int,
+    message_id: string,
+    epoch_id: int,
+    header_sig_bundle: string,
+    merkle_proof: string
+  ): bool {
+    only_bridge_op()
+    not_paused()
+    no_reentry()
+
+    require(is_address(recipient), "bad recipient")
+    require(amount >= MIN_MINT, "below min")
+    require(amount <= self.max_mint_per_tx, "above per-tx cap")
+    require(len(message_id) == 66, "bad message_id")
+    require(self.processed_mint_ids[message_id] == 0, "replay")
+
+    reset_daily_mint()
+    require(self.daily_minted + amount <= self.daily_mint_cap, "daily cap")
+
+    self.processed_mint_ids[message_id] = 1
+    self.mint_count += 1
+    self.mint_nonce += 1
+    self.daily_minted += amount
+
+    self.balances[recipient] += amount
+    self.total_supply_public += amount
+    self.outstanding_supply += amount
+
+    self.user_last_mint_epoch[recipient] = epoch
+
+    emit Minted(recipient, amount, message_id, epoch_id)
+    emit Transfer(self_addr, recipient, amount)
+    release_reentry()
+    return true
+  }
+
+  fn burn_to_ethereum(eth_recipient: string, amount: int): int {
+    not_paused()
+    no_reentry()
+    require(amount > 0, "zero amount")
+    require(amount <= self.max_burn_per_tx, "above per-tx cap")
+    validate_eth_address(eth_recipient)
+
+    let bal = free_balance(caller)
+    require(bal >= amount, "insufficient")
+
+    reset_daily_burn()
+    require(self.daily_burned + amount <= self.daily_burn_cap, "daily cap")
+
+    let fee = amount * BURN_FEE_BPS / FEE_DENOMINATOR
+    let net_amount = amount - fee
+
+    self.balances[caller] -= amount
+    self.total_supply_public -= amount
+    self.outstanding_supply -= net_amount
+    self.daily_burned += amount
+    self.burn_nonce += 1
+    self.burn_fees_accumulated += fee
+
+    self.burn_history[self.burn_nonce] = caller
+    self.burn_amounts[self.burn_nonce] = net_amount
+    self.burn_eth_recipients[self.burn_nonce] = eth_recipient
+
+    emit Burned(caller, net_amount, eth_recipient, self.burn_nonce)
+    emit Transfer(caller, self_addr, amount)
+    if fee > 0 {
+      emit FeeCollected("burn", fee)
+    }
+    release_reentry()
+    return self.burn_nonce
+  }
+
+  fn transfer(to: address, amount: int): bool {
+    not_paused()
+    require(is_address(to), "bad to")
+    require(amount > 0, "zero amount")
+    let bal = free_balance(caller)
+    require(bal >= amount, "insufficient")
+    self.balances[caller] -= amount
+    self.balances[to] += amount
+    emit Transfer(caller, to, amount)
+    return true
+  }
+
+  fn approve(spender: address, amount: int): bool {
+    not_paused()
+    require(is_address(spender), "bad spender")
+    self.allowances[caller][spender] = amount
+    emit Approval(caller, spender, amount)
+    return true
+  }
+
+  fn transfer_from(from: address, to: address, amount: int): bool {
+    not_paused()
+    require(is_address(from), "bad from")
+    require(is_address(to), "bad to")
+    require(amount > 0, "zero amount")
+    let allowed = self.allowances[from][caller]
+    require(allowed >= amount, "allowance")
+    let bal = self.balances[from] - self.collateral_locked[from]
+    require(bal >= amount, "insufficient")
+    self.allowances[from][caller] = allowed - amount
+    self.balances[from] -= amount
+    self.balances[to] += amount
+    emit Transfer(from, to, amount)
+    return true
+  }
+
+  fn shield(amount: int): bool {
+    not_paused()
+    no_reentry()
+    require(amount > 0, "zero amount")
+    let bal = free_balance(caller)
+    require(bal >= amount, "insufficient")
+
+    let fee = amount * SHIELD_FEE_BPS / FEE_DENOMINATOR
+    let net = amount - fee
+    require(net > 0, "fee eats all")
+
+    self.balances[caller] -= amount
+    self.total_supply_public -= amount
+    self.total_supply_encrypted += net
+
+    if self.has_encrypted[caller] == 0 {
+      self.encrypted_balances[caller] = to_string(net)
+      self.has_encrypted[caller] = 1
+    } else {
+      self.encrypted_balances[caller] = to_string(to_int(self.encrypted_balances[caller]) + net)
+    }
+
+    if fee > 0 {
+      self.burn_fees_accumulated += fee
+      emit FeeCollected("shield", fee)
+    }
+
+    emit Shielded(caller, net, fee)
+    emit Transfer(caller, self_addr, amount)
+    release_reentry()
+    return true
+  }
+
+  fn private_transfer(to: address, ct_amount: string): bool {
+    not_paused()
+    require(is_address(to), "bad to")
+    require(self.has_encrypted[caller] == 1, "no encrypted bal")
+    require(len(ct_amount) > 0, "empty ct")
+
+    let sender_ct = self.encrypted_balances[caller]
+    let pk = fhe_load_pk(to_string(caller))
+    let sender_cipher = fhe_deser(sender_ct)
+    let amt_cipher = fhe_deser(ct_amount)
+
+    let new_sender = fhe_sub(pk, sender_cipher, amt_cipher)
+    self.encrypted_balances[caller] = fhe_ser(new_sender)
+
+    if self.has_encrypted[to] == 0 {
+      self.encrypted_balances[to] = ct_amount
+      self.has_encrypted[to] = 1
+    } else {
+      let recipient_cipher = fhe_deser(self.encrypted_balances[to])
+      let new_recipient = fhe_add(pk, recipient_cipher, amt_cipher)
+      self.encrypted_balances[to] = fhe_ser(new_recipient)
+    }
+
+    emit PrivateTransfer(caller, to)
+    return true
+  }
+
+  fn unshield(ct_amount: string, range_proof: string, claimed_amount: int): bool {
+    not_paused()
+    no_reentry()
+    require(self.has_encrypted[caller] == 1, "no encrypted bal")
+    require(claimed_amount > 0, "zero claim")
+    require(len(ct_amount) > 0, "empty ct")
+    require(len(range_proof) > 0, "empty proof")
+
+    let pk = fhe_load_pk(to_string(caller))
+    let sender_cipher = fhe_deser(self.encrypted_balances[caller])
+    let amt_cipher = fhe_deser(ct_amount)
+
+    let zero_proof_ok = fhe_verify_bound(pk, amt_cipher, claimed_amount, range_proof)
+    require(zero_proof_ok, "range proof invalid")
+
+    let fee = claimed_amount * UNSHIELD_FEE_BPS / FEE_DENOMINATOR
+    let net = claimed_amount - fee
+    require(net > 0, "fee eats all")
+
+    let new_sender = fhe_sub(pk, sender_cipher, amt_cipher)
+    self.encrypted_balances[caller] = fhe_ser(new_sender)
+    self.total_supply_encrypted -= claimed_amount
+
+    self.balances[caller] += net
+    self.total_supply_public += net
+
+    if fee > 0 {
+      self.burn_fees_accumulated += fee
+      emit FeeCollected("unshield", fee)
+    }
+
+    emit Unshielded(caller, net, fee)
+    emit Transfer(self_addr, caller, net)
+    release_reentry()
+    return true
+  }
+
+  fn lock_collateral(owner: address, amount: int): bool {
+    only_lending()
+    require(is_address(owner), "bad owner")
+    require(amount > 0, "zero amount")
+    let bal = self.balances[owner] - self.collateral_locked[owner]
+    require(bal >= amount, "insufficient")
+    self.collateral_locked[owner] += amount
+    emit CollateralLocked(owner, amount)
+    return true
+  }
+
+  fn release_collateral(owner: address, amount: int): bool {
+    only_lending()
+    require(is_address(owner), "bad owner")
+    require(amount > 0, "zero amount")
+    require(self.collateral_locked[owner] >= amount, "not enough locked")
+    self.collateral_locked[owner] -= amount
+    emit CollateralReleased(owner, amount)
+    return true
+  }
+
+  fn seize_collateral(owner: address, recipient: address, amount: int): bool {
+    only_lending()
+    require(is_address(owner), "bad owner")
+    require(is_address(recipient), "bad recipient")
+    require(amount > 0, "zero amount")
+    require(self.collateral_locked[owner] >= amount, "not enough locked")
+    require(self.balances[owner] >= amount, "balance mismatch")
+    self.collateral_locked[owner] -= amount
+    self.balances[owner] -= amount
+    self.balances[recipient] += amount
+    emit CollateralSeized(owner, recipient, amount)
+    emit Transfer(owner, recipient, amount)
+    return true
+  }
+
+  fn set_lending_contract(c: address): bool {
+    only_owner()
+    require(is_address(c), "bad addr")
+    let old = self.lending_contract
+    self.lending_contract = c
+    self.lending_is_set = 1
+    emit OperatorChanged("lending", old, c)
+    return true
+  }
+
+  fn set_insurance_contract(c: address): bool {
+    only_owner()
+    require(is_address(c), "bad addr")
+    let old = self.insurance_contract
+    self.insurance_contract = c
+    self.insurance_is_set = 1
+    emit OperatorChanged("insurance", old, c)
+    return true
+  }
+
+  fn set_bridge_operator(op: address): bool {
+    only_owner()
+    require(is_address(op), "bad addr")
+    let old = self.bridge_operator
+    self.bridge_operator = op
+    emit OperatorChanged("bridge_op", old, op)
+    return true
+  }
+
+  fn update_validator_set(new_hash: string, new_quorum: int): bool {
+    only_owner()
+    require(len(new_hash) == 66, "bad hash")
+    require(new_quorum > 0, "zero quorum")
+    self.signer_set_hash = new_hash
+    self.quorum = new_quorum
+    self.validator_set_version += 1
+    emit ValidatorSetUpdated(new_hash, new_quorum, self.validator_set_version)
+    return true
+  }
+
+  fn withdraw_accumulated_fees(recipient: address, amount: int): bool {
+    only_owner()
+    require(is_address(recipient), "bad recipient")
+    require(amount > 0, "zero amount")
+    require(self.burn_fees_accumulated >= amount, "insufficient fees")
+    self.burn_fees_accumulated -= amount
+    self.balances[recipient] += amount
+    emit Transfer(self_addr, recipient, amount)
+    return true
+  }
+
+  fn route_fees_to_insurance(amount: int): bool {
+    only_owner()
+    require(amount > 0, "zero amount")
+    require(self.burn_fees_accumulated >= amount, "insufficient fees")
+    require(self.insurance_is_set == 1, "no insurance set")
+    self.burn_fees_accumulated -= amount
+    self.balances[self.insurance_contract] += amount
+    emit Transfer(self_addr, self.insurance_contract, amount)
+    return true
+  }
+
+  fn pause(): bool {
+    only_guardian()
+    self.paused = 1
+    emit Paused(caller)
+    return true
+  }
+
+  fn unpause(): bool {
+    only_owner()
+    self.paused = 0
+    emit Unpaused(caller)
+    return true
+  }
+
+  fn transfer_ownership(new_owner: address): bool {
+    only_owner()
+    require(is_address(new_owner), "bad addr")
+    let old = self.owner
+    self.owner = new_owner
+    emit OperatorChanged("owner", old, new_owner)
+    return true
+  }
+
+  fn update_guardian(new_guardian: address): bool {
+    only_owner()
+    require(is_address(new_guardian), "bad addr")
+    let old = self.guardian
+    self.guardian = new_guardian
+    emit OperatorChanged("guardian", old, new_guardian)
+    return true
+  }
+
+  fn update_caps(new_max_mint: int, new_max_burn: int, new_daily_mint: int, new_daily_burn: int): bool {
+    only_owner()
+    require(new_max_mint > 0, "zero mint per-tx")
+    require(new_max_burn > 0, "zero burn per-tx")
+    require(new_daily_mint > 0, "zero daily mint")
+    require(new_daily_burn > 0, "zero daily burn")
+    require(new_max_mint <= CAP_CEILING, "above ceiling")
+    require(new_max_burn <= CAP_CEILING, "above ceiling")
+    require(new_daily_mint <= CAP_CEILING, "above ceiling")
+    require(new_daily_burn <= CAP_CEILING, "above ceiling")
+    require(new_max_mint <= new_daily_mint, "per-tx above daily")
+    require(new_max_burn <= new_daily_burn, "per-tx above daily")
+    let max_new_mint = self.max_mint_per_tx * CAP_RAISE_RATIO_BPS / FEE_DENOMINATOR
+    let max_new_burn = self.max_burn_per_tx * CAP_RAISE_RATIO_BPS / FEE_DENOMINATOR
+    let max_new_daily_mint = self.daily_mint_cap * CAP_RAISE_RATIO_BPS / FEE_DENOMINATOR
+    let max_new_daily_burn = self.daily_burn_cap * CAP_RAISE_RATIO_BPS / FEE_DENOMINATOR
+    require(new_max_mint <= max_new_mint, "mint per-tx raise too sharp")
+    require(new_max_burn <= max_new_burn, "burn per-tx raise too sharp")
+    require(new_daily_mint <= max_new_daily_mint, "daily mint raise too sharp")
+    require(new_daily_burn <= max_new_daily_burn, "daily burn raise too sharp")
+    let delta = epoch - self.last_cap_update_epoch
+    require(delta >= 1440, "cap cooldown")
+    self.max_mint_per_tx = new_max_mint
+    self.max_burn_per_tx = new_max_burn
+    self.daily_mint_cap = new_daily_mint
+    self.daily_burn_cap = new_daily_burn
+    self.last_cap_update_epoch = epoch
+    emit CapsUpdated(new_max_mint, new_max_burn, new_daily_mint, new_daily_burn)
+    return true
+  }
+
+  fn emergency_lower_caps(new_max_mint: int, new_max_burn: int, new_daily_mint: int, new_daily_burn: int): bool {
+    only_guardian()
+    require(new_max_mint <= self.max_mint_per_tx, "not lower")
+    require(new_max_burn <= self.max_burn_per_tx, "not lower")
+    require(new_daily_mint <= self.daily_mint_cap, "not lower")
+    require(new_daily_burn <= self.daily_burn_cap, "not lower")
+    self.max_mint_per_tx = new_max_mint
+    self.max_burn_per_tx = new_max_burn
+    self.daily_mint_cap = new_daily_mint
+    self.daily_burn_cap = new_daily_burn
+    emit CapsUpdated(new_max_mint, new_max_burn, new_daily_mint, new_daily_burn)
+    return true
+  }
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  view fn balance_of(addr: address): int {
+    return self.balances[addr]
+  }
+
+  view fn free_balance_of(addr: address): int {
+    return self.balances[addr] - self.collateral_locked[addr]
+  }
+
+  view fn collateral_locked_of(addr: address): int {
+    return self.collateral_locked[addr]
+  }
+
+  view fn allowance(owner: address, spender: address): int {
+    return self.allowances[owner][spender]
+  }
+
+  view fn total_supply(): int {
+    return self.total_supply_public + self.total_supply_encrypted
+  }
+
+  view fn total_supply_public_only(): int {
+    return self.total_supply_public
+  }
+
+  view fn total_supply_encrypted_only(): int {
+    return self.total_supply_encrypted
+  }
+
+  view fn outstanding_supply(): int {
+    return self.outstanding_supply
+  }
+
+  view fn supply_invariant(): int {
+    let total = self.total_supply_public + self.total_supply_encrypted + self.burn_fees_accumulated
+    return self.outstanding_supply - total
+  }
+
+  view fn encrypted_balance_of(addr: address): string {
+    return self.encrypted_balances[addr]
+  }
+
+  view fn has_encrypted_balance(addr: address): int {
+    return self.has_encrypted[addr]
+  }
+
+  view fn is_paused(): int {
+    return self.paused
+  }
+
+  view fn get_bridge_operator(): address {
+    return self.bridge_operator
+  }
+
+  view fn get_lending_contract(): address {
+    return self.lending_contract
+  }
+
+  view fn get_insurance_contract(): address {
+    return self.insurance_contract
+  }
+
+  view fn get_signer_set_hash(): string {
+    return self.signer_set_hash
+  }
+
+  view fn get_quorum(): int {
+    return self.quorum
+  }
+
+  view fn get_validator_set_version(): int {
+    return self.validator_set_version
+  }
+
+  view fn get_burn_info(nonce: int): string {
+    let s = to_string(self.burn_history[nonce])
+    s = concat(s, "|")
+    s = concat(s, to_string(self.burn_amounts[nonce]))
+    s = concat(s, "|")
+    s = concat(s, self.burn_eth_recipients[nonce])
+    return s
+  }
+
+  view fn is_mint_processed(message_id: string): int {
+    return self.processed_mint_ids[message_id]
+  }
+
+  view fn daily_mint_remaining(): int {
+    let today = epoch / EPOCHS_PER_DAY
+    if today != self.last_mint_day {
+      return self.daily_mint_cap
+    }
+    if self.daily_minted >= self.daily_mint_cap {
+      return 0
+    }
+    return self.daily_mint_cap - self.daily_minted
+  }
+
+  view fn daily_burn_remaining(): int {
+    let today = epoch / EPOCHS_PER_DAY
+    if today != self.last_burn_day {
+      return self.daily_burn_cap
+    }
+    if self.daily_burned >= self.daily_burn_cap {
+      return 0
+    }
+    return self.daily_burn_cap - self.daily_burned
+  }
+
+  view fn current_caps(): string {
+    let s = to_string(self.max_mint_per_tx)
+    s = concat(s, "|")
+    s = concat(s, to_string(self.max_burn_per_tx))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.daily_mint_cap))
+    s = concat(s, "|")
+    s = concat(s, to_string(self.daily_burn_cap))
+    return s
+  }
+
+  view fn accumulated_fees(): int {
+    return self.burn_fees_accumulated
+  }
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  
+
+  view fn version(): string {
+    return VERSION
+  }
+
+  view fn symbol(): string {
+    return SYMBOL
+  }
+
+  view fn decimals(): int {
+    return DECIMALS
+  }
+}
